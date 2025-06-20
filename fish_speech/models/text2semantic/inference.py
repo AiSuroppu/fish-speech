@@ -21,7 +21,7 @@ from fish_speech.content_sequence import (
     TextPart,
     VQPart,
 )
-from fish_speech.tokenizer import IM_END_TOKEN
+from fish_speech.tokenizer import IM_END_TOKEN, PAD_TOKEN
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 torch._inductor.config.coordinate_descent_tuning = True
@@ -54,21 +54,42 @@ def logits_to_probs(
     top_p: torch.Tensor,
     repetition_penalty: torch.Tensor,
     previous_tokens: Optional[torch.Tensor] = None,
+    pad_token_id: Optional[int] = None,
 ) -> torch.Tensor:
     # Apply repetition penalty
-    if previous_tokens is not None:
+    if previous_tokens is not None and previous_tokens.numel() > 0:
+        dim = logits.ndim - 1
         previous_tokens = previous_tokens.long()
-        score = torch.gather(logits, dim=-1, index=previous_tokens)
-        score = torch.where(
+
+        # Gather the original logits for the tokens in history
+        score = torch.gather(logits, dim, previous_tokens)
+
+        # Apply penalty: score > 0 -> score / penalty, score < 0 -> score * penalty
+        penalized_score = torch.where(
             score < 0, score * repetition_penalty, score / repetition_penalty
         )
-        logits.scatter_(dim=-1, index=previous_tokens, src=score)
+        
+        # Do not penalize padding tokens
+        if pad_token_id is not None:
+            valid_tokens_mask = (previous_tokens != pad_token_id)
+            penalized_score = torch.where(valid_tokens_mask, penalized_score, score)
+
+        # Scatter the updated scores back to the logits tensor
+        logits = logits.scatter(dim, previous_tokens, penalized_score)
 
     # Apply top-p sampling
     sorted_logits, sorted_indices = torch.sort(logits, descending=True)
     cum_probs = torch.cumsum(torch.nn.functional.softmax(sorted_logits, dim=-1), dim=-1)
     sorted_indices_to_remove = cum_probs > top_p
-    sorted_indices_to_remove[0] = False  # keep at least one option
+    
+    # Ensure at least one token is kept
+    if logits.dim() > 1:
+        # Batched case
+        sorted_indices_to_remove[:, 0] = False
+    else:
+        # Non-batched case
+        sorted_indices_to_remove[0] = False
+        
     indices_to_remove = sorted_indices_to_remove.scatter(
         dim=-1, index=sorted_indices, src=sorted_indices_to_remove
     )
@@ -483,6 +504,266 @@ def generate_long(
 
         # This indicates the end of the current sample
         yield GenerateResponse(action="next")
+
+
+def generate_t2s_batch(
+    *,
+    model: BaseTransformer,
+    texts: list[str],
+    device: str | torch.device,
+    max_new_tokens: int = 0,
+    top_p: float = 0.8,
+    repetition_penalty: float = 1.1,
+    temperature: float = 0.8,
+    prompt_text: Optional[Union[str, list[str]]] = None,
+    prompt_tokens: Optional[Union[torch.Tensor, list[torch.Tensor]]] = None,
+):
+    assert 0 < top_p <= 1, "top_p must be in (0, 1]"
+    assert 0 < repetition_penalty < 2, "repetition_penalty must be in (0, 2)"
+    assert 0 < temperature < 2, "temperature must be in (0, 2)"
+
+    tokenizer = model.tokenizer
+    batch_size = len(texts)
+    pad_token_id = tokenizer.get_token_id(PAD_TOKEN)
+    im_end_token_id = tokenizer.get_token_id(IM_END_TOKEN)
+    codebook_dim = 1 + model.config.num_codebooks
+
+    # 1. Handle prompt broadcasting
+    if prompt_text is not None and isinstance(prompt_text, str):
+        prompt_text = [prompt_text] * batch_size
+    if (
+        prompt_tokens is not None
+        and isinstance(prompt_tokens, torch.Tensor)
+        and prompt_tokens.ndim == 2
+    ):
+        prompt_tokens = [prompt_tokens] * batch_size
+
+    # 2. Preprocessing and Padding
+    prompt_sequences = []
+    prompt_lengths = []
+
+    for i in range(batch_size):
+        seq = ContentSequence(modality="interleave")
+
+        current_prompt_text_exists = (
+            prompt_text is not None and i < len(prompt_text) and prompt_text[i]
+        )
+        current_prompt_tokens_exist = (
+            prompt_tokens is not None
+            and i < len(prompt_tokens)
+            and prompt_tokens[i] is not None
+        )
+
+        if current_prompt_text_exists and current_prompt_tokens_exist:
+            seq.append(
+                [TextPart(text=prompt_text[i]), VQPart(codes=prompt_tokens[i].cpu())],
+                add_end=True,
+                speaker=0,
+            )
+
+        seq.append([TextPart(text=texts[i])], add_end=False, speaker=0)
+
+        encoded, _, _ = seq.encode_for_inference(
+            tokenizer, num_codebooks=model.config.num_codebooks
+        )
+        prompt_sequences.append(encoded)
+        prompt_lengths.append(encoded.shape[1])
+
+    max_prompt_len = max(prompt_lengths)
+
+    # Use right-padding for simplicity and correctness in generation
+    padded_prompts = torch.full(
+        (batch_size, codebook_dim, max_prompt_len),
+        fill_value=pad_token_id,
+        dtype=torch.long,
+        device=device,
+    )
+
+    for i, seq in enumerate(prompt_sequences):
+        length = seq.shape[1]
+        padded_prompts[i, :, :length] = seq
+
+    key_padding_mask = padded_prompts[:, 0, :] == pad_token_id
+
+    # 3. Setup KV Cache for Batch
+    if max_new_tokens <= 0:
+        max_new_tokens = model.config.max_seq_len - max_prompt_len
+
+    max_total_len = min(model.config.max_seq_len, max_prompt_len + max_new_tokens)
+    max_new_tokens = max_total_len - max_prompt_len
+
+    model.setup_caches(
+        max_batch_size=batch_size,
+        max_seq_len=max_total_len,
+        dtype=next(model.parameters()).dtype,
+    )
+
+    # 4. Efficient Prefill Pass
+    logger.info("Prefilling KV cache for batch...")
+    input_pos = torch.arange(0, max_prompt_len, device=device)
+    prefill_result = model.forward_generate(
+        padded_prompts, input_pos, key_padding_mask=key_padding_mask, return_all=True
+    )
+
+    # For right-padding, the last meaningful token is at `length - 1`
+    last_token_indices = torch.tensor(
+        [l - 1 for l in prompt_lengths], device=device, dtype=torch.long
+    )
+
+    # 5. Iterative Generation
+    current_logits = prefill_result.logits[torch.arange(batch_size), last_token_indices]
+    current_hidden_states = prefill_result.hidden_states[
+        torch.arange(batch_size), last_token_indices
+    ]
+
+    generated_codes_list = [[] for _ in range(batch_size)]
+    eos_reached = torch.zeros(batch_size, dtype=torch.bool, device=device)
+
+    temperature = torch.tensor(temperature, device=device, dtype=torch.bfloat16)
+    top_p = torch.tensor(top_p, device=device, dtype=torch.bfloat16)
+    repetition_penalty = torch.tensor(
+        repetition_penalty, device=device, dtype=torch.bfloat16
+    )
+
+    sequence_lengths = torch.tensor(prompt_lengths, device=device, dtype=torch.long)
+
+    token_history = torch.full(
+        (batch_size, codebook_dim, max_new_tokens),
+        fill_value=pad_token_id,
+        dtype=torch.long,
+        device=device,
+    )
+
+    for i in tqdm(range(max_new_tokens), desc="Generating tokens"):
+        active_mask = ~eos_reached
+        if not active_mask.any():
+            break
+
+        active_indices = torch.where(active_mask)[0]
+        num_active = active_indices.shape[0]
+
+        # A. Create active-only sub-batch of states
+        active_logits = current_logits[active_indices]
+
+        window_size = 16
+        start_pos = max(0, i - window_size)
+        active_history_window = token_history[active_indices, ..., start_pos:i]
+
+        # B. Sample the next main token for active sequences
+        probs = logits_to_probs(
+            active_logits,
+            temperature,
+            top_p,
+            repetition_penalty,
+            previous_tokens=active_history_window[:, 0, :],
+            pad_token_id=pad_token_id,
+        )
+        active_next_token = multinomial_sample_one_no_sync(probs)
+
+        # C. Generate VQ codes for active sequences
+        active_hidden_states = current_hidden_states[active_indices]
+
+        # C.1. Clear fast VQ cache for the new step.
+        # The VQ generation is a self-contained loop for each main token.
+        # We must reset its KV cache to avoid state leakage between steps.
+        for layer in model.fast_layers:
+            if layer.attention.kv_cache is not None:
+                layer.attention.kv_cache.k_cache.fill_(0)
+                layer.attention.kv_cache.v_cache.fill_(0)
+
+        # C.2. Prime the fast transformer
+        input_pos_prime = torch.zeros(num_active, dtype=torch.long, device=device)
+        model.forward_generate_fast(
+            active_hidden_states.unsqueeze(1), input_pos_prime, active_cache_mask=active_mask
+        )
+
+        # C.3. Autoregressively generate remaining VQ codes
+        active_first_vq_code = active_next_token - tokenizer.semantic_begin_id
+        active_first_vq_code.clamp_(min=0)
+
+        active_codes_for_next_step = [active_next_token, active_first_vq_code]
+        active_hidden_states_fast = model.fast_embeddings(active_first_vq_code)
+
+        for codebook_idx in range(1, model.config.num_codebooks):
+            input_pos_fast = torch.full(
+                (num_active,),
+                fill_value=codebook_idx,
+                device=device,
+                dtype=torch.long,
+            )
+            fast_logits = model.forward_generate_fast(
+                active_hidden_states_fast, input_pos_fast, active_cache_mask=active_mask
+            )
+            short_logits = fast_logits.squeeze(1)[:, :1024]
+
+            probs_fast = logits_to_probs(
+                short_logits,
+                temperature,
+                top_p,
+                repetition_penalty,
+                previous_tokens=active_history_window[:, codebook_idx + 1, :],
+                pad_token_id=pad_token_id,
+            )
+            active_next_vq_code = multinomial_sample_one_no_sync(probs_fast)
+
+            active_hidden_states_fast = model.fast_embeddings(active_next_vq_code)
+            active_codes_for_next_step.append(active_next_vq_code)
+
+        active_current_batch_all_codes = torch.cat(active_codes_for_next_step, dim=1)
+
+        # D. Update history and EOS state for the full batch
+        token_history[active_indices, :, i] = active_current_batch_all_codes.long()
+
+        next_token = torch.full(
+            (batch_size,), pad_token_id, device=device, dtype=torch.long
+        )
+        next_token[active_indices] = active_current_batch_all_codes[:, 0].long()
+        eos_reached |= next_token == im_end_token_id
+
+        # E. Append VQ codes to output list for non-finished sequences
+        active_vq_codes_for_step = active_current_batch_all_codes[:, 1:]
+        for idx, original_idx in enumerate(active_indices):
+            if next_token[original_idx] != im_end_token_id:
+                generated_codes_list[original_idx].append(
+                    active_vq_codes_for_step[idx].clone()
+                )
+
+        # F. Prepare for the next main transformer step using the active-only sub-batch
+        active_codes_for_slow_model = active_current_batch_all_codes.unsqueeze(-1)
+        active_sequence_lengths = sequence_lengths[active_indices]
+
+        # Create a causal attention mask for the sub-batch, respecting each sequence's length
+        max_len_in_cache = active_sequence_lengths.max() + 1
+        generation_attn_mask = (
+            torch.arange(max_len_in_cache, device=device)[None, :]
+            < (active_sequence_lengths[:, None] + 1)
+        )
+
+        result = model.forward_generate(
+            active_codes_for_slow_model,
+            active_sequence_lengths,  # Pass current lengths as positions
+            active_cache_mask=active_mask,
+            generation_attn_mask=generation_attn_mask,
+        )
+
+        # G. Scatter results back to the full-sized state tensors
+        current_logits[active_indices] = result.logits.squeeze(1)
+        current_hidden_states[active_indices] = result.hidden_states.squeeze(1)
+
+        # H. Update sequence lengths for active sequences
+        sequence_lengths[active_indices] += 1
+
+    # 6. Post-processing
+    output_codes = []
+    for i in range(batch_size):
+        if not generated_codes_list[i]:
+            output_codes.append(None)
+            continue
+
+        codes_tensor = torch.stack(generated_codes_list[i], dim=1)
+        output_codes.append(codes_tensor.cpu())
+
+    return output_codes
 
 
 @dataclass

@@ -17,7 +17,7 @@ from torch.utils.checkpoint import checkpoint
 from transformers import AutoTokenizer
 
 from fish_speech.models.text2semantic.lora import LoraConfig, setup_lora
-from fish_speech.tokenizer import SEMANTIC_TOKENS, FishTokenizer
+from fish_speech.tokenizer import SEMANTIC_TOKENS, FishTokenizer, PAD_TOKEN
 
 
 def find_multiple(n: int, k: int) -> int:
@@ -149,14 +149,43 @@ class KVCache(nn.Module):
         self.register_buffer("k_cache", torch.zeros(cache_shape, dtype=dtype))
         self.register_buffer("v_cache", torch.zeros(cache_shape, dtype=dtype))
 
-    def update(self, input_pos, k_val, v_val):
-        # input_pos: [S], k_val: [B, H, S, D]
-        assert input_pos.shape[0] == k_val.shape[2]
+    def update(self, input_pos, k_val, v_val, active_mask: Optional[Tensor] = None):
+        # input_pos: [S] for prefill, [B_sub] for generation
+        # k_val/v_val: [B_sub, H, S, D]
+        # active_mask: [B_full] or None, True if active
+        bsz_sub, _, seq_len, _ = k_val.shape
 
-        k_out = self.k_cache
-        v_out = self.v_cache
-        k_out[:, :, input_pos] = k_val
-        v_out[:, :, input_pos] = v_val
+        if seq_len > 1:
+            # Prefill Mode: input_pos is a range [S]
+            assert active_mask is None, "active_mask should not be used in prefill"
+            self.k_cache[:bsz_sub, :, input_pos] = k_val
+            self.v_cache[:bsz_sub, :, input_pos] = v_val
+            bsz_out = bsz_sub
+        else:
+            # Generation Mode: input_pos is a tensor of positions [B_sub]
+            k_val = k_val.squeeze(2)
+            v_val = v_val.squeeze(2)
+            
+            if active_mask is not None:
+                active_indices = torch.where(active_mask)[0]
+                # Use a loop for clarity and robustness, as bsz_sub is small
+                for i in range(bsz_sub):
+                    original_batch_idx = active_indices[i]
+                    position = input_pos[i]
+                    self.k_cache[original_batch_idx, :, position] = k_val[i]
+                    self.v_cache[original_batch_idx, :, position] = v_val[i]
+                bsz_out = active_mask.shape[0]
+            else:
+                # Fallback for single-sample or non-masked inference
+                for i in range(bsz_sub):
+                    position = input_pos[i]
+                    self.k_cache[i, :, position] = k_val[i]
+                    self.v_cache[i, :, position] = v_val[i]
+                bsz_out = bsz_sub
+
+        max_pos = input_pos.max()
+        k_out = self.k_cache[:bsz_out, :, :max_pos + 1]
+        v_out = self.v_cache[:bsz_out, :, :max_pos + 1]
 
         return k_out, v_out
 
@@ -240,6 +269,11 @@ class BaseTransformer(nn.Module):
         if self.max_seq_len >= max_seq_len and self.max_batch_size >= max_batch_size:
             return
 
+        try:
+            device = next(self.parameters()).device
+        except StopIteration:
+            device = "cpu"
+
         max_seq_len = find_multiple(max_seq_len, 8)
         self.max_seq_len = max_seq_len
         self.max_batch_size = max_batch_size
@@ -251,7 +285,7 @@ class BaseTransformer(nn.Module):
                 self.config.n_local_heads,
                 self.config.head_dim,
                 dtype=dtype,
-            )
+            ).to(device)
 
     def embed(self, inp: Tensor) -> Tensor:
         embeds = []
@@ -320,20 +354,32 @@ class BaseTransformer(nn.Module):
         self,
         inp: Tensor,
         input_pos: Optional[Tensor] = None,
+        key_padding_mask: Optional[Tensor] = None,
+        active_cache_mask: Optional[Tensor] = None,
+        generation_attn_mask: Optional[Tensor] = None,
         audio_masks: Optional[Tensor] = None,
         audio_parts: Optional[Tensor] = None,
         return_all: bool = False,
     ) -> BaseTransformerForwardResult:
-        # This is used for generation, optimized for torch compile
-        # assert (
-        #     self.max_seq_len != -1 and self.max_batch_size != -1
-        # ), "Please call setup_caches before forward_generate"
+        # inp has shape (B, D, S) where D = 1 + num_codebooks
+        
+        # Main token embedding (with padding protection)
+        main_indices = inp[:, 0]
+        pad_token_id = self.tokenizer.get_token_id(PAD_TOKEN)
+        main_pad_mask = (main_indices == pad_token_id)
+        # Clamp pad tokens to index 0 to avoid OOB, then zero them out
+        clamped_main_indices = torch.where(main_pad_mask, 0, main_indices)
+        x = self.embeddings(clamped_main_indices)
+        x[main_pad_mask] = 0
 
+        # Codebook embeddings (with padding protection)
         embeds = []
         for i in range(self.config.num_codebooks):
-            emb = self.codebook_embeddings(
-                inp[:, i + 1] + i * self.config.codebook_size
-            )
+            codebook_indices = inp[:, i + 1]
+            code_pad_mask = (codebook_indices == pad_token_id)
+            clamped_indices = torch.where(code_pad_mask, 0, codebook_indices)
+            emb = self.codebook_embeddings(clamped_indices + i * self.config.codebook_size)
+            emb[code_pad_mask] = 0
             embeds.append(emb)
 
         vq_embeds_sum = torch.stack(embeds, dim=1).sum(dim=1)
@@ -341,9 +387,13 @@ class BaseTransformer(nn.Module):
         vq_masks = (inp[:, 0] >= self.tokenizer.semantic_begin_id) & (
             inp[:, 0] <= self.tokenizer.semantic_end_id
         )
-
+        # Ensure vq_embeds_sum is zero where it's not a VQ token
         vq_embeds_sum[~vq_masks] = 0
-        x = self.embeddings(inp[:, 0]) + vq_embeds_sum
+        # Combine embeddings
+        x = x + vq_embeds_sum
+
+        if input_pos is None:
+            input_pos = torch.arange(inp.shape[-1], device=x.device)
 
         if self.config.scale_codebook_embeddings:
             # Expand vq_masks to match x's shape
@@ -360,17 +410,28 @@ class BaseTransformer(nn.Module):
             else:
                 x[audio_masks] = audio_embeds
 
-        if input_pos is None:
-            input_pos = torch.arange(inp.shape[-1], device=x.device)
-            max_seq_len = inp.shape[-1]
-        else:
-            max_seq_len = self.max_seq_len
+        # Mask creation
+        seq_len = inp.shape[-1]
+        if seq_len > 1:  # Prefill phase
+            mask = self.causal_mask[None, None, :seq_len, :seq_len]
+            if key_padding_mask is not None:
+                # Pytorch SDPA mask: True means keep, False means mask.
+                # Our key_padding_mask: True means pad, False means keep.
+                attn_mask = ~key_padding_mask[:, None, None, :]
+                mask = mask & attn_mask
+        else:  # Generation phase (seq_len == 1)
+            if generation_attn_mask is not None:
+                # Reshape mask from [B, K] to [B, 1, 1, K] for attention.
+                # K is the total sequence length in the cache.
+                mask = generation_attn_mask.unsqueeze(1).unsqueeze(2)
+            else:
+                # Fallback for single-sample inference where this mask isn't needed.
+                mask = None
 
-        mask = self.causal_mask[None, None, input_pos, :max_seq_len]  # (B, N, Q, K)
         freqs_cis = self.freqs_cis[input_pos]
 
         for layer in self.layers:
-            x = layer(x, freqs_cis, mask, input_pos=input_pos)
+            x = layer(x, freqs_cis, mask, input_pos=input_pos, active_cache_mask=active_cache_mask)
 
         # If prefill, we only calculate the logits of last token
         if x.size(1) > 1 and not return_all:
@@ -617,6 +678,11 @@ class DualARTransformer(BaseTransformer):
     ):
         super().setup_caches(max_batch_size, max_seq_len, dtype)
 
+        try:
+            device = next(self.parameters()).device
+        except StopIteration:
+            device = "cpu"
+
         # Fast transformer
         # The max seq len here is the number of codebooks
         for b in self.fast_layers:
@@ -626,7 +692,7 @@ class DualARTransformer(BaseTransformer):
                 self.config.fast_n_local_heads,
                 self.config.fast_head_dim,
                 dtype=dtype,
-            )
+            ).to(device)
 
     def forward(
         self,
@@ -701,18 +767,38 @@ class DualARTransformer(BaseTransformer):
         )
 
     def forward_generate_fast(
-        self, x: Tensor, input_pos: Optional[Tensor] = None
+        self,
+        x: Tensor,
+        input_pos: Optional[Tensor] = None,
+        active_cache_mask: Optional[Tensor] = None,
     ) -> Tensor:
         # Fast transformer
         x = x.view(x.shape[0], 1, -1)
 
-        fast_mask = self.causal_mask[
-            None, None, input_pos, : self.config.num_codebooks
-        ]  # (B, N, Q, K)
+        # The query tensor `x` always has a sequence length of 1.
+        # We need a mask that allows this single query to attend to all previous keys.
+        # We can create this by selecting the single correct row from the causal mask
+        # corresponding to the current VQ codebook position.
+
+        # All items in the batch are at the same VQ codebook position
+        query_pos = input_pos[0].item()
+        key_seq_len = query_pos + 1
+
+        # Select the single row for the current query_pos.
+        # This creates a mask of shape [1, 1, 1, key_seq_len] that broadcasts correctly
+        # to the entire active sub-batch.
+        fast_mask = self.causal_mask[None, None, query_pos : query_pos + 1, :key_seq_len]
+
         fast_freqs_cis = self.fast_freqs_cis[input_pos]
 
         for layer in self.fast_layers:
-            x = layer(x, fast_freqs_cis, fast_mask, input_pos=input_pos)
+            x = layer(
+                x,
+                fast_freqs_cis,
+                fast_mask,
+                input_pos=input_pos,
+                active_cache_mask=active_cache_mask,
+            )
 
         # unflatten the batch and num_codebooks
         fast_out = self.fast_norm(x)  # only take the last token
@@ -724,10 +810,23 @@ class DualARTransformer(BaseTransformer):
         self,
         x: Tensor,
         input_pos: Optional[Tensor] = None,
+        key_padding_mask: Optional[Tensor] = None,
+        active_cache_mask: Optional[Tensor] = None,
+        generation_attn_mask: Optional[Tensor] = None,
         audio_masks: Optional[Tensor] = None,
         audio_parts: Optional[Tensor] = None,
+        return_all: bool = False,
     ) -> TransformerForwardResult:
-        x = super().forward_generate(x, input_pos, audio_masks, audio_parts)
+        x = super().forward_generate(
+            x,
+            input_pos,
+            key_padding_mask,
+            active_cache_mask,
+            generation_attn_mask,
+            audio_masks,
+            audio_parts,
+            return_all=return_all,
+        )
         x.hidden_states = self.fast_project_in(x.hidden_states)
         return x
 
@@ -741,9 +840,14 @@ class TransformerBlock(nn.Module):
         self.attention_norm = RMSNorm(config.dim, config.norm_eps)
 
     def forward(
-        self, x: Tensor, freqs_cis: Tensor, mask: Tensor, input_pos: Tensor = None
+        self,
+        x: Tensor,
+        freqs_cis: Tensor,
+        mask: Tensor,
+        input_pos: Tensor = None,
+        active_cache_mask: Optional[Tensor] = None,
     ) -> Tensor:
-        h = x + self.attention(self.attention_norm(x), freqs_cis, mask, input_pos)
+        h = x + self.attention(self.attention_norm(x), freqs_cis, mask, input_pos, active_cache_mask=active_cache_mask)
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
 
@@ -791,6 +895,7 @@ class Attention(nn.Module):
         freqs_cis: Tensor,
         mask: Tensor,
         input_pos: Optional[Tensor] = None,
+        active_cache_mask: Optional[Tensor] = None,
     ) -> Tensor:
         bsz, seqlen, _ = x.shape
 
@@ -812,37 +917,31 @@ class Attention(nn.Module):
         q, k, v = map(lambda x: x.transpose(1, 2), (q, k, v))
 
         if self.kv_cache is not None:
-            k, v = self.kv_cache.update(input_pos, k, v)
+            k_full, v_full = self.kv_cache.update(input_pos, k, v, active_mask=active_cache_mask)
+            
+            if active_cache_mask is not None:
+                active_indices = torch.where(active_cache_mask)[0]
+                k = k_full[active_indices]
+                v = v_full[active_indices]
+            else:
+                k, v = k_full, v_full
 
         k = k.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
         v = v.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
 
-        if self.use_sdpa:
-            if mask is None:
-                with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
-                    y = F.scaled_dot_product_attention(
-                        q,
-                        k,
-                        v,
-                        dropout_p=self.dropout if self.training else 0.0,
-                        is_causal=True,
-                        # No third party attn_mask here to use flash_attention
-                    )
-            else:
-                y = F.scaled_dot_product_attention(
-                    q,
-                    k,
-                    v,
-                    attn_mask=mask,
-                    dropout_p=self.dropout if self.training else 0.0,
-                )
+        # Determine dropout. This is essential for training.
+        dropout_p = self.dropout if self.training else 0.0
+
+        # This branching is critical for correctness across all use cases.
+        if mask is None:
+            # Use the optimized causal path for single-sample inference and unpadded training.
+            y = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=None, dropout_p=dropout_p, is_causal=True
+            )
         else:
-            y = self.eq_scaled_dot_product_attention(
-                q,
-                k,
-                v,
-                attn_mask=mask,
-                dropout_p=self.dropout if self.training else 0.0,
+            # Use the provided mask for padded prefill, batched generation, or padded training.
+            y = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=mask, dropout_p=dropout_p, is_causal=False
             )
 
         y = y.transpose(1, 2).contiguous().view(bsz, seqlen, q_size)
@@ -927,7 +1026,17 @@ def precompute_freqs_cis(seq_len: int, n_elem: int, base: int = 10000) -> Tensor
 
 def apply_rotary_emb(x: Tensor, freqs_cis: Tensor) -> Tensor:
     xshaped = x.float().reshape(*x.shape[:-1], -1, 2)
-    freqs_cis = freqs_cis.view(1, xshaped.size(1), 1, xshaped.size(3), 2)
+    # xshaped shape: (batch_size, seq_len, n_head, head_dim/2, 2)
+    batch_size, seq_len, _, head_dim_half, _ = xshaped.shape
+    
+    # Reshape freqs_cis for broadcasting
+    if seq_len == 1:
+        # Generation: freqs_cis is batched [B, D/2, 2]. Reshape to [B, 1, 1, D/2, 2]
+        freqs_cis = freqs_cis.view(batch_size, 1, 1, head_dim_half, 2)
+    else:
+        # Prefill: freqs_cis is not batched [S, D/2, 2]. Reshape to [1, S, 1, D/2, 2]
+        freqs_cis = freqs_cis.view(1, seq_len, 1, head_dim_half, 2)
+
     x_out2 = torch.stack(
         [
             xshaped[..., 0] * freqs_cis[..., 0] - xshaped[..., 1] * freqs_cis[..., 1],
