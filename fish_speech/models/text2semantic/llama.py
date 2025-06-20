@@ -17,7 +17,7 @@ from torch.utils.checkpoint import checkpoint
 from transformers import AutoTokenizer
 
 from fish_speech.models.text2semantic.lora import LoraConfig, setup_lora
-from fish_speech.tokenizer import SEMANTIC_TOKENS, FishTokenizer
+from fish_speech.tokenizer import SEMANTIC_TOKENS, FishTokenizer, PAD_TOKEN
 
 
 def find_multiple(n: int, k: int) -> int:
@@ -235,10 +235,15 @@ class BaseTransformer(nn.Module):
             self.apply(self._init_weights)
 
     def setup_caches(
-        self, max_batch_size: int, max_seq_len: int, dtype: torch.dtype = torch.bfloat16
+        self, max_batch_size: int, max_seq_len: int, dtype: torch.dtype = torch.bfloat16, force_recreate: bool = False,
     ):
-        if self.max_seq_len >= max_seq_len and self.max_batch_size >= max_batch_size:
+        if not force_recreate and self.max_seq_len >= max_seq_len and self.max_batch_size >= max_batch_size:
             return
+
+        try:
+            device = next(self.parameters()).device
+        except StopIteration:
+            device = "cpu"
 
         max_seq_len = find_multiple(max_seq_len, 8)
         self.max_seq_len = max_seq_len
@@ -251,7 +256,7 @@ class BaseTransformer(nn.Module):
                 self.config.n_local_heads,
                 self.config.head_dim,
                 dtype=dtype,
-            )
+            ).to(device)
 
     def embed(self, inp: Tensor) -> Tensor:
         embeds = []
@@ -329,11 +334,25 @@ class BaseTransformer(nn.Module):
         #     self.max_seq_len != -1 and self.max_batch_size != -1
         # ), "Please call setup_caches before forward_generate"
 
+        # inp has shape (B, D, S) where D = 1 + num_codebooks
+        
+        # Main token embedding (with padding protection)
+        main_indices = inp[:, 0]
+        pad_token_id = self.tokenizer.get_token_id(PAD_TOKEN)
+        main_pad_mask = (main_indices == pad_token_id)
+        # Clamp pad tokens to index 0 to avoid OOB, then zero them out
+        clamped_main_indices = torch.where(main_pad_mask, 0, main_indices)
+        x = self.embeddings(clamped_main_indices)
+        x[main_pad_mask] = 0
+
+        # Codebook embeddings (with padding protection)
         embeds = []
         for i in range(self.config.num_codebooks):
-            emb = self.codebook_embeddings(
-                inp[:, i + 1] + i * self.config.codebook_size
-            )
+            codebook_indices = inp[:, i + 1]
+            code_pad_mask = (codebook_indices == pad_token_id)
+            clamped_indices = torch.where(code_pad_mask, 0, codebook_indices)
+            emb = self.codebook_embeddings(clamped_indices + i * self.config.codebook_size)
+            emb[code_pad_mask] = 0
             embeds.append(emb)
 
         vq_embeds_sum = torch.stack(embeds, dim=1).sum(dim=1)
@@ -341,9 +360,10 @@ class BaseTransformer(nn.Module):
         vq_masks = (inp[:, 0] >= self.tokenizer.semantic_begin_id) & (
             inp[:, 0] <= self.tokenizer.semantic_end_id
         )
-
+        # Ensure vq_embeds_sum is zero where it's not a VQ token
         vq_embeds_sum[~vq_masks] = 0
-        x = self.embeddings(inp[:, 0]) + vq_embeds_sum
+        # Combine embeddings
+        x = x + vq_embeds_sum
 
         if self.config.scale_codebook_embeddings:
             # Expand vq_masks to match x's shape
@@ -364,7 +384,9 @@ class BaseTransformer(nn.Module):
             input_pos = torch.arange(inp.shape[-1], device=x.device)
             max_seq_len = inp.shape[-1]
         else:
-            max_seq_len = self.max_seq_len
+            max_seq_len = input_pos.max() + 1
+            if self.max_seq_len != -1:
+                max_seq_len = self.max_seq_len
 
         mask = self.causal_mask[None, None, input_pos, :max_seq_len]  # (B, N, Q, K)
         freqs_cis = self.freqs_cis[input_pos]
@@ -613,9 +635,14 @@ class DualARTransformer(BaseTransformer):
         self.apply(self._init_weights)
 
     def setup_caches(
-        self, max_batch_size: int, max_seq_len: int, dtype: torch.dtype = torch.bfloat16
+        self, max_batch_size: int, max_seq_len: int, dtype: torch.dtype = torch.bfloat16, force_recreate: bool = False,
     ):
-        super().setup_caches(max_batch_size, max_seq_len, dtype)
+        super().setup_caches(max_batch_size, max_seq_len, dtype, force_recreate=force_recreate)
+
+        try:
+            device = next(self.parameters()).device
+        except StopIteration:
+            device = "cpu"
 
         # Fast transformer
         # The max seq len here is the number of codebooks
@@ -626,7 +653,7 @@ class DualARTransformer(BaseTransformer):
                 self.config.fast_n_local_heads,
                 self.config.fast_head_dim,
                 dtype=dtype,
-            )
+            ).to(device)
 
     def forward(
         self,
@@ -726,8 +753,9 @@ class DualARTransformer(BaseTransformer):
         input_pos: Optional[Tensor] = None,
         audio_masks: Optional[Tensor] = None,
         audio_parts: Optional[Tensor] = None,
+        return_all: bool = False,
     ) -> TransformerForwardResult:
-        x = super().forward_generate(x, input_pos, audio_masks, audio_parts)
+        x = super().forward_generate(x, input_pos, audio_masks, audio_parts, return_all=return_all)
         x.hidden_states = self.fast_project_in(x.hidden_states)
         return x
 
