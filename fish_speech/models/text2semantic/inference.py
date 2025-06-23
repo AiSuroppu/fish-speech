@@ -506,68 +506,29 @@ def generate_long(
         yield GenerateResponse(action="next")
 
 
-def generate_t2s_batch(
+def _generate_t2s_batch(
     *,
     model: BaseTransformer,
-    texts: list[str],
+    batch_sequences: list[torch.Tensor],
     device: str | torch.device,
     max_new_tokens: int = 0,
     top_p: float = 0.8,
     repetition_penalty: float = 1.1,
     temperature: float = 0.8,
-    prompt_text: Optional[Union[str, list[str]]] = None,
-    prompt_tokens: Optional[Union[torch.Tensor, list[torch.Tensor]]] = None,
 ):
     assert 0 < top_p <= 1, "top_p must be in (0, 1]"
     assert 0 < repetition_penalty < 2, "repetition_penalty must be in (0, 2)"
     assert 0 < temperature < 2, "temperature must be in (0, 2)"
 
     tokenizer = model.tokenizer
-    batch_size = len(texts)
+    batch_size = len(batch_sequences)
     pad_token_id = tokenizer.get_token_id(PAD_TOKEN)
     im_end_token_id = tokenizer.get_token_id(IM_END_TOKEN)
     codebook_dim = 1 + model.config.num_codebooks
 
-    # 1. Handle prompt broadcasting
-    if prompt_text is not None and isinstance(prompt_text, str):
-        prompt_text = [prompt_text] * batch_size
-    if (
-        prompt_tokens is not None
-        and isinstance(prompt_tokens, torch.Tensor)
-        and prompt_tokens.ndim == 2
-    ):
-        prompt_tokens = [prompt_tokens] * batch_size
-
     # 2. Preprocessing and Padding
-    prompt_sequences = []
-    prompt_lengths = []
-
-    for i in range(batch_size):
-        seq = ContentSequence(modality="interleave")
-
-        current_prompt_text_exists = (
-            prompt_text is not None and i < len(prompt_text) and prompt_text[i]
-        )
-        current_prompt_tokens_exist = (
-            prompt_tokens is not None
-            and i < len(prompt_tokens)
-            and prompt_tokens[i] is not None
-        )
-
-        if current_prompt_text_exists and current_prompt_tokens_exist:
-            seq.append(
-                [TextPart(text=prompt_text[i]), VQPart(codes=prompt_tokens[i].cpu())],
-                add_end=True,
-                speaker=0,
-            )
-
-        seq.append([TextPart(text=texts[i])], add_end=False, speaker=0)
-
-        encoded, _, _ = seq.encode_for_inference(
-            tokenizer, num_codebooks=model.config.num_codebooks
-        )
-        prompt_sequences.append(encoded)
-        prompt_lengths.append(encoded.shape[1])
+    prompt_sequences = batch_sequences
+    prompt_lengths = [seq.shape[1] for seq in prompt_sequences]
 
     max_prompt_len = max(prompt_lengths)
 
@@ -599,7 +560,6 @@ def generate_t2s_batch(
     )
 
     # 4. Efficient Prefill Pass
-    logger.info("Prefilling KV cache for batch...")
     input_pos = torch.arange(0, max_prompt_len, device=device)
     prefill_result = model.forward_generate(
         padded_prompts, input_pos, key_padding_mask=key_padding_mask, return_all=True
@@ -764,6 +724,123 @@ def generate_t2s_batch(
         output_codes.append(codes_tensor.cpu())
 
     return output_codes
+
+
+def generate_t2s_batch(
+    *,
+    model: BaseTransformer,
+    texts: list[str],
+    device: str | torch.device,
+    batch_size: int = 1,
+    max_new_tokens: int = 0,
+    top_p: float = 0.8,
+    repetition_penalty: float = 1.1,
+    temperature: float = 0.8,
+    prompt_text: Optional[Union[str, list[str]]] = None,
+    prompt_tokens: Optional[Union[torch.Tensor, list[torch.Tensor]]] = None,
+):
+    if isinstance(prompt_text, list) and len(prompt_text) != len(texts):
+        logger.warning(
+            f"Mismatch in lengths: got {len(texts)} texts but {len(prompt_text)} prompt_texts. "
+            "Prompts will only be applied to the first {len(prompt_text)} texts."
+        )
+    model_size = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    tokenizer = model.tokenizer
+    all_results = []
+
+    for i in range(0, len(texts), batch_size):
+        logger.info(
+            f"Processing batch {i // batch_size + 1}/{(len(texts) + batch_size - 1) // batch_size}..."
+        )
+
+        # Slice the inputs for the current batch
+        batch_texts = texts[i : i + batch_size]
+        current_batch_size = len(batch_texts)
+
+        # Handle prompt broadcasting and slicing
+        if prompt_text is not None and isinstance(prompt_text, str):
+            current_prompt_text = [prompt_text] * current_batch_size
+        elif isinstance(prompt_text, list):
+            current_prompt_text = prompt_text[i : i + batch_size]
+        else:
+            current_prompt_text = None
+
+        if (
+            prompt_tokens is not None
+            and isinstance(prompt_tokens, torch.Tensor)
+            and prompt_tokens.ndim == 2
+        ):
+            current_prompt_tokens = [prompt_tokens] * current_batch_size
+        elif isinstance(prompt_tokens, list):
+            current_prompt_tokens = prompt_tokens[i : i + batch_size]
+        else:
+            current_prompt_tokens = None
+
+        # Create ContentSequence and encode for each item in the batch
+        batch_sequences = []
+        for j in range(current_batch_size):
+            seq = ContentSequence(modality="interleave")
+            current_prompt_text_exists = (
+                current_prompt_text is not None
+                and j < len(current_prompt_text)
+                and current_prompt_text[j]
+            )
+            current_prompt_tokens_exist = (
+                current_prompt_tokens is not None
+                and j < len(current_prompt_tokens)
+                and current_prompt_tokens[j] is not None
+            )
+
+            if current_prompt_text_exists and current_prompt_tokens_exist:
+                seq.append(
+                    [
+                        TextPart(text=current_prompt_text[j]),
+                        VQPart(codes=current_prompt_tokens[j].cpu()),
+                    ],
+                    add_end=True,
+                    speaker=0,
+                )
+
+            seq.append([TextPart(text=batch_texts[j])], add_end=False, speaker=0)
+
+            encoded, _, _ = seq.encode_for_inference(
+                tokenizer, num_codebooks=model.config.num_codebooks
+            )
+            batch_sequences.append(encoded.to(device=device))
+
+        # Start timer and call the worker function
+        t0 = time.perf_counter()
+
+        batch_output = _generate_t2s_batch(
+            model=model,
+            batch_sequences=batch_sequences,
+            device=device,
+            max_new_tokens=max_new_tokens,
+            top_p=top_p,
+            repetition_penalty=repetition_penalty,
+            temperature=temperature,
+        )
+
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        t = time.perf_counter() - t0
+
+        # Performance Logging
+        tokens_generated = sum(t.shape[1] for t in batch_output if t is not None)
+        tokens_sec = tokens_generated / t
+        logger.info(
+            f"Batch generated {tokens_generated} tokens in {t:.02f} seconds, {tokens_sec:.02f} tokens/sec"
+        )
+        logger.info(f"Bandwidth achieved: {model_size * tokens_sec / 1e9:.02f} GB/s")
+
+        if torch.cuda.is_available():
+            logger.info(
+                f"GPU Memory used: {torch.cuda.max_memory_reserved() / 1e9:.02f} GB"
+            )
+
+        all_results.extend(batch_output)
+
+    return all_results
 
 
 @dataclass
